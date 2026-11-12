@@ -1,0 +1,315 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <TM1637Display.h>
+#include <esp_arduino_version.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <time.h>
+#include <sys/time.h>
+#include "Config.h"
+#include "SunriseMotion.h"
+#include "WebPage.h"
+
+WebServer server(80);
+Preferences prefs;
+TM1637Display display(CLK_PIN,DIO_PIN);
+ClockSettings settings;
+SunriseMotion motion;
+SemaphoreHandle_t motionMutex=nullptr;
+bool storageReady=false,hardwareReady=false,pwmReady=false;
+bool reverseDirection=false;
+String wifiName,wifiPassword;
+bool pendingNetwork=false;
+uint32_t networkAt=0;
+int64_t lastAlarmKey=-1;
+String eventText="После включения задайте время и исходное положение.";
+
+void lockMotion(){xSemaphoreTake(motionMutex,portMAX_DELAY);}
+void unlockMotion(){xSemaphoreGive(motionMutex);}
+SunriseMotion snapshot(){lockMotion();SunriseMotion copy=motion;unlockMotion();return copy;}
+
+bool initLight(){
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+ return ledcAttach(LED_PIN,5000,8);
+#else
+ double frequency=ledcSetup(0,5000,8);
+ ledcAttachPin(LED_PIN,0);
+ return frequency>0;
+#endif
+}
+void writeLight(uint8_t value){
+ if(!pwmReady)return;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+ ledcWrite(LED_PIN,value);
+#else
+ ledcWrite(0,value);
+#endif
+}
+
+
+void motorTask(void*){
+ int previousLight=-1;
+ for(;;){
+   lockMotion();
+   int direction=motion.tick((uint64_t)esp_timer_get_time());
+   if(direction){
+     bool level=(direction>0)^reverseDirection;
+     digitalWrite(DIR_PIN,level?HIGH:LOW);
+     delayMicroseconds(5);
+     digitalWrite(STEP_PIN,HIGH);
+     delayMicroseconds(5);
+     digitalWrite(STEP_PIN,LOW);
+   }
+   int light=motion.light();
+   if(light!=previousLight){writeLight(light);previousLight=light;}
+   unlockMotion();
+   vTaskDelay(1);
+ }
+}
+
+bool clockValid(int64_t utc){return utc>=1704067200LL && utc<4102444800LL;}
+String moscowTime(int64_t utc,bool seconds){
+ if(!clockValid(utc))return "--:--";
+ time_t local=(time_t)(utc+MOSCOW_OFFSET_SECONDS);
+ struct tm t;gmtime_r(&local,&t);
+ char buf[12];strftime(buf,sizeof(buf),seconds?"%H:%M:%S":"%H:%M",&t);
+ return String(buf);
+}
+String alarmTime(){char buf[12];snprintf(buf,sizeof(buf),"%02u:%02u",(unsigned)(settings.minute/60),(unsigned)(settings.minute%60));return String(buf);}
+String jsonString(const String& value){
+ String out="\"";
+ for(size_t i=0;i<value.length();++i){
+   unsigned char c=value[i];
+   if(c=='"'||c=='\\'){out+='\\';out+=(char)c;}
+   else if(c<32){char escaped[7];snprintf(escaped,sizeof(escaped),"\\u%04x",c);out+=escaped;}
+   else out+=(char)c;
+ }
+ return out+'"';
+}
+void reply(int code,const String& message){
+ server.sendHeader("Cache-Control","no-store");
+ server.send(code,"application/json; charset=utf-8",String("{\"message\":")+jsonString(message)+"}");
+}
+bool postAllowed(){
+ // Не разрешаем сторонним страницам незаметно посылать команды устройству.
+ if(server.header("X-WeggUp")!="1"){reply(403,"Откройте страницу самого будильника.");return false;}
+ return true;
+}
+bool parseNumber(const String& value,int64_t low,int64_t high,int64_t& result){
+ if(value.length()==0 || value.length()>12)return false;
+ int64_t n=0;
+ for(size_t i=0;i<value.length();++i){char c=value[i];if(c<'0'||c>'9')return false;n=n*10+(c-'0');}
+ if(n<low || n>high)return false;
+ result=n;return true;
+}
+bool saveSettings(const ClockSettings& next){
+ if(!storageReady)return false;
+ if(prefs.putBytes("settings",&next,sizeof(next))!=sizeof(next))return false;
+ settings=next;return true;
+}
+bool validSettings(const ClockSettings& s){
+ return s.magic==0x57534731 && s.minute<1440 && s.angle>=1 && s.angle<=180 &&
+        s.riseSeconds>=5 && s.riseSeconds<=3600 && s.holdSeconds<=3600 &&
+        s.maxLight>=1 && stepsForAngle(s.angle)>=1 && 2.0*stepsForAngle(s.angle)/s.riseSeconds<=MAX_STEP_RATE;
+}
+void loadSettings(){
+ storageReady=prefs.begin("weggup-sun",false);
+ if(!storageReady){eventText="Ошибка памяти: сохранение настроек недоступно.";return;}
+ ClockSettings loaded;
+ if(prefs.getBytesLength("settings")==sizeof(loaded)){
+   prefs.getBytes("settings",&loaded,sizeof(loaded));
+   if(validSettings(loaded))settings=loaded;
+ }
+ lastAlarmKey=prefs.getLong64("lastAlarm",-1);
+ NetworkSettings network;
+ if(prefs.getBytesLength("network")==sizeof(network)){
+   prefs.getBytes("network",&network,sizeof(network));
+   if(network.magic==0x574e5431 && network.ssid[32]==0 && network.password[63]==0){
+     wifiName=network.ssid;wifiPassword=network.password;
+   }
+ }
+}
+void stopCycle(){lockMotion();motion.stop();writeLight(0);unlockMotion();}
+
+void handleStatus(){
+ SunriseMotion m=snapshot();int64_t utc=(int64_t)time(nullptr);
+ const char* phase="Ожидание";т 
+ switch(m.state){
+   case SunriseMotion::State::Rising:phase="Рассвет";break;
+   case SunriseMotion::State::Holding:phase="Пробуждение";break;
+   case SunriseMotion::State::Returning:phase="Возврат";break;
+   case SunriseMotion::State::Jogging:phase="Настройка положения";break;
+   case SunriseMotion::State::Fault:phase="Ошибка движения — задайте ноль заново";break;
+   default:break;
+ }
+ String json;json.reserve(1100);
+ json="{\"clock\":"+jsonString(moscowTime(utc,true));
+ json+=",\"timeValid\":"+String(clockValid(utc)?"true":"false");
+ json+=",\"alarm\":"+jsonString(alarmTime());
+ json+=",\"enabled\":"+String(settings.enabled?"true":"false");
+ json+=",\"angle\":"+String(settings.angle);
+ json+=",\"riseSeconds\":"+String(settings.riseSeconds);
+ json+=",\"holdSeconds\":"+String(settings.holdSeconds);
+ json+=",\"maxLight\":"+String(settings.maxLight);
+ json+=",\"reverse\":"+String(settings.reverse?"true":"false");
+ json+=",\"phase\":"+jsonString(phase);
+ json+=",\"positionKnown\":"+String(m.referenced?"true":"false");
+ json+=",\"ready\":"+String(m.ready()&&hardwareReady?"true":"false");
+ json+=",\"busy\":"+String(m.busy()?"true":"false");
+ json+=",\"canConfigure\":"+String(m.canConfigure()?"true":"false");
+ json+=",\"fault\":"+String(m.state==SunriseMotion::State::Fault?"true":"false");
+ json+=",\"hardwareReady\":"+String(hardwareReady?"true":"false");
+ json+=",\"progress\":"+String(m.progress(),4);
+ json+=",\"light\":"+String(m.light());
+ json+=",\"steps\":"+String(m.position)+",\"travelSteps\":"+String(m.travel);
+ json+=",\"microsteps\":"+String(MICROSTEPS);
+ json+=",\"sensor\":"+String(digitalRead(SENSOR_PIN));
+ json+=",\"connected\":"+String(WiFi.status()==WL_CONNECTED?"true":"false");
+ json+=",\"ip\":"+jsonString(WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():"");
+ json+=",\"ssid\":"+jsonString(wifiName);
+ json+=",\"event\":"+jsonString(eventText)+"}";
+ server.sendHeader("Cache-Control","no-store");server.send(200,"application/json; charset=utf-8",json);
+}
+void handleAlarm(){
+ if(!postAllowed())return;
+ String value=server.arg("time"),enabled=server.arg("enabled");int64_t h,m;
+ if(value.length()!=5 || value[2]!=':' ||
+    !parseNumber(value.substring(0,2),0,23,h) || !parseNumber(value.substring(3,5),0,59,m) ||
+    (enabled!="0" && enabled!="1")){reply(400,"Проверьте время будильника.");return;}
+ ClockSettings next=settings;next.minute=h*60+m;next.enabled=enabled=="1";
+ if(!next.enabled)stopCycle();
+ if(!saveSettings(next)){reply(500,"Не удалось сохранить настройки. Движение при выключении остановлено.");return;}
+ eventText=next.enabled?"Ежедневный будильник включён на "+alarmTime()+" по Москве.":"Ежедневный будильник выключен.";
+ reply(200,eventText);
+}
+void handleMotionSettings(){
+ if(!postAllowed())return;
+ int64_t angle,rise,hold,light;String reverse=server.arg("reverse");
+ if(!parseNumber(server.arg("angle"),1,180,angle) || !parseNumber(server.arg("riseSeconds"),5,3600,rise) ||
+    !parseNumber(server.arg("holdSeconds"),0,3600,hold) || !parseNumber(server.arg("maxLight"),1,255,light) ||
+    (reverse!="0"&&reverse!="1")){reply(400,"Проверьте угол, длительность и яркость.");return;}
+ if(stepsForAngle(angle)<1 || 2.0*stepsForAngle(angle)/rise>MAX_STEP_RATE){reply(400,"Проверьте передаточное отношение и увеличьте длительность движения.");return;}
+ SunriseMotion m=snapshot();
+ if(!m.canConfigure()){reply(409,"Остановите цикл и верните механизм в ноль.");return;}
+ ClockSettings next=settings;next.angle=angle;next.riseSeconds=rise;next.holdSeconds=hold;next.maxLight=light;next.reverse=reverse=="1";
+ bool changedDirection=next.reverse!=settings.reverse;
+ if(!saveSettings(next)){reply(500,"Не удалось сохранить параметры.");return;}
+ lockMotion();
+ motion.configure(stepsForAngle(next.angle),next.riseSeconds,next.holdSeconds,RETURN_SECONDS,next.maxLight);
+ reverseDirection=next.reverse;
+ if(changedDirection)motion.forgetZero();
+ unlockMotion();
+ reply(200,changedDirection?"Направление изменено. Задайте исходное положение заново.":"Параметры рассвета сохранены.");
+}
+void handleMotor(){
+ if(!postAllowed())return;
+ String command=server.arg("command");
+ if(command=="stop"){stopCycle();eventText="Цикл остановлен. Для следующего запуска нажмите «Вернуть в ноль».";reply(200,eventText);return;}
+ if(!hardwareReady){reply(503,"Движение недоступно: ошибка запуска задачи или PWM.");return;}
+ bool ok=false;uint64_t now=esp_timer_get_time();
+ lockMotion();
+ if(command=="zero")ok=motion.setZero();
+ else if(command=="start")ok=motion.start(now);
+ else if(command=="return")ok=motion.returnToZero(now);
+ else if(command=="jogPlus")ok=motion.jog(JOG_STEPS,now);
+ else if(command=="jogMinus")ok=motion.jog(-JOG_STEPS,now);
+ else if(command=="forget" && !motion.busy()){motion.forgetZero();motion.state=SunriseMotion::State::Idle;ok=true;}
+ unlockMotion();
+ if(!ok){reply(409,"Команда недоступна. Остановите цикл; проверьте ноль и допустимое направление.");return;}
+ if(command=="zero")eventText="Исходное положение задано. Теперь можно проверить короткое движение.";
+ else if(command=="start")eventText="Проверочный рассвет запущен.";
+ else if(command=="return")eventText="Возврат в заданный ноль.";
+ else if(command=="forget")eventText="Ноль сброшен. Выставьте механизм короткими командами.";
+ else eventText="Короткое движение для настройки.";
+ reply(200,eventText);
+}
+void handleTime(){
+ if(!postAllowed())return;
+ int64_t epoch;
+ if(!parseNumber(server.arg("epoch"),1704067200LL,4102444799LL,epoch)){reply(400,"Неверное время телефона.");return;}
+ struct timeval tv;tv.tv_sec=(time_t)epoch;tv.tv_usec=0;
+ if(settimeofday(&tv,nullptr)!=0){reply(500,"Не удалось установить время.");return;}
+ reply(200,"Время принято. На дисплее всегда московское время, UTC+3.");
+}
+void handleNetwork(){
+ if(!postAllowed())return;
+ if(snapshot().busy()){reply(409,"Настраивайте сеть после окончания движения.");return;}
+ String ssid=server.arg("ssid"),password=server.arg("password");
+ if(ssid.length()>32 || password.length()>63 || (ssid.length()>0 && password.length()>0 && password.length()<8)){
+   reply(400,"SSID: до 32 байт; пароль: 8–63 символа либо пустой для открытой сети.");return;
+ }
+ NetworkSettings network;
+ ssid.toCharArray(network.ssid,sizeof(network.ssid));password.toCharArray(network.password,sizeof(network.password));
+ if(!storageReady || prefs.putBytes("network",&network,sizeof(network))!=sizeof(network)){reply(500,"Не удалось сохранить Wi-Fi.");return;}
+ wifiName=ssid;wifiPassword=password;pendingNetwork=true;networkAt=millis()+1000;
+ reply(200,ssid.length()?"Подключение начнётся через секунду. Точка WeggUp-Setup останется доступной.":"Домашняя сеть отключена. Можно передать время с телефона.");
+}
+void connectHome(){
+ WiFi.disconnect(false,false);
+ if(wifiName.length()){WiFi.begin(wifiName.c_str(),wifiPassword.c_str());}
+}
+void checkAlarm(){
+ if(!settings.enabled || !hardwareReady)return;
+ int64_t key=moscowAlarmKey((int64_t)time(nullptr),settings.minute);
+ if(key<0 || key<=lastAlarmKey)return;
+ // Запоминаем попытку ДО запуска: один запуск на дату и заданную минуту,
+ // в том числе после перезагрузки. Пропущенный из-за неизвестного нуля не догоняем.
+ lastAlarmKey=key;
+ if(!storageReady || prefs.putLong64("lastAlarm",key)!=sizeof(int64_t)){
+   eventText="Будильник пропущен: не удалось записать отметку запуска.";return;
+ }
+ lockMotion();bool started=motion.start((uint64_t)esp_timer_get_time());unlockMotion();
+ eventText=started?"Будильник сработал в "+alarmTime()+" по Москве.":"Будильник пропущен: механизм занят или не установлен в ноль.";
+}
+void updateClock(){
+ static uint32_t previous=0;if(millis()-previous<100)return;previous=millis();
+ SunriseMotion m=snapshot();int64_t utc=time(nullptr);
+ bool visible=!m.alarmActive() || ((millis()/500)%2==0);
+ display.setBrightness(CLOCK_BRIGHTNESS,true);
+ if(!visible){display.clear();return;}
+ if(!clockValid(utc)){const uint8_t dashes[]={0x40,0x40,0x40,0x40};display.setSegments(dashes);return;}
+ time_t local=(time_t)(utc+MOSCOW_OFFSET_SECONDS);struct tm t;gmtime_r(&local,&t);
+ display.showNumberDecEx(t.tm_hour*100+t.tm_min,0x40,true);
+}
+void setup(){
+ Serial.begin(115200);
+ pinMode(STEP_PIN,OUTPUT);digitalWrite(STEP_PIN,LOW);
+ pinMode(DIR_PIN,OUTPUT);digitalWrite(DIR_PIN,LOW);
+ pinMode(LED_PIN,OUTPUT);digitalWrite(LED_PIN,LOW);
+ pinMode(SENSOR_PIN,INPUT_PULLUP);
+ display.setBrightness(CLOCK_BRIGHTNESS,true);
+ const uint8_t dashes[]={0x40,0x40,0x40,0x40};display.setSegments(dashes);
+ motionMutex=xSemaphoreCreateMutex();
+ if(!motionMutex){Serial.println("ERROR: mutex allocation. Restart ESP32.");for(;;)delay(1000);}
+ loadSettings();motion.maxRate=MAX_STEP_RATE;
+ bool configured=motion.configure(stepsForAngle(settings.angle),settings.riseSeconds,settings.holdSeconds,RETURN_SECONDS,settings.maxLight);
+ reverseDirection=settings.reverse;
+ pwmReady=initLight();writeLight(0);
+ hardwareReady=configured && pwmReady && xTaskCreatePinnedToCore(motorTask,"sunrise",3072,nullptr,1,nullptr,1)==pdPASS;
+ if(!hardwareReady)eventText="Ошибка запуска двигателя/PWM. Проверьте Config.h и перезапустите ESP32.";
+ WiFi.persistent(false);WiFi.mode(WIFI_AP_STA);WiFi.setAutoReconnect(true);
+ WiFi.softAPConfig(IPAddress(192,168,4,1),IPAddress(192,168,4,1),IPAddress(255,255,255,0));
+ bool apOK=WiFi.softAP(AP_NAME,AP_PASSWORD);
+ Serial.println(apOK?"Open http://192.168.4.1 (WeggUp-Setup)":"ERROR: Wi-Fi AP failed");
+ connectHome();
+ 
+ configTime(0,0,"pool.ntp.org","time.cloudflare.com");
+ const char* headers[]={"X-WeggUp"};server.collectHeaders(headers,1);
+ server.on("/",HTTP_GET,[]{server.sendHeader("Cache-Control","no-store");server.send_P(200,"text/html; charset=utf-8",WEB_PAGE);});
+ server.on("/api/status",HTTP_GET,handleStatus);
+ server.on("/api/alarm",HTTP_POST,handleAlarm);
+ server.on("/api/motion/settings",HTTP_POST,handleMotionSettings);
+ server.on("/api/motor",HTTP_POST,handleMotor);
+ server.on("/api/time",HTTP_POST,handleTime);
+ server.on("/api/network",HTTP_POST,handleNetwork);
+ server.onNotFound([]{reply(404,"Страница не найдена.");});server.begin();
+}
+void loop(){
+ server.handleClient();
+ if(pendingNetwork && (int32_t)(millis()-networkAt)>=0){pendingNetwork=false;connectHome();}
+ checkAlarm();updateClock();delay(2);
+}
